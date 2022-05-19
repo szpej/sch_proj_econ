@@ -1,0 +1,628 @@
+---
+title: "Ryzyko - Intel oraz AMD"
+author: "Paweł Stąpyra"
+date: "28.01.2022"
+output: 
+  beamer_presentation:
+    theme: "Szeged"
+    colortheme: "dolphin"
+---
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+```{r, include=FALSE}
+library(tidyverse)
+library(urca)
+library(forecast)
+library(rugarch)
+library(copula)
+import::from(quantmod, getSymbols)
+import::from(zoo, index)
+import::from(quantmod, dailyReturn)
+import::from(aTSA, arch.test)
+import::from(xts, xts)
+import::from(xts, try.xts)
+import::from(VineCopula,BiCopSelect)
+import::from(e1071, skewness)
+import::from(e1071, kurtosis)
+import::from(fitdistrplus, descdist)
+import::from(MASS, fitness = fitdistr)
+import::from(fitdistrplus, fitdist)
+import::from(scatterplot3d,scatterplot3d)
+set.seed(123)
+```
+
+
+```{r, include=FALSE}
+start<-format(as.Date("2015-01-01"),"%Y-%m-%d")
+end<-format(as.Date("2021-12-31"),"%Y-%m-%d")
+
+intel <-getSymbols('IBM', src= "yahoo", from=start, to=end, auto.assign = F)
+amd <-getSymbols('AMD', src= "yahoo", from=start, to=end, auto.assign = F)
+
+intel_return <- dailyReturn(intel, leading = FALSE, type = "log")
+intel_return <- intel_return[-1]
+amd_return <- dailyReturn(amd[,4], leading = FALSE, type = "log")
+amd_return <- amd_return[-1]
+
+
+intel_train <- intel_return[1:1731] # koniec w 16 października 2021
+intel_test<- intel_return[1732:1761]
+amd_train <- amd_return[1:1731] 
+amd_test<- amd_return[1732:1761]
+
+train_AMD_IBM <- cbind(intel_train, amd_train)
+test_AMD_IBM <- cbind(intel_test, amd_test)
+```
+
+# Inspekcja szeregów czasowych
+
+## Cena zamknięcia w okresie  01.01.2015-16.10.2021
+
+```{r, echo = FALSE, include=TRUE}
+par(mfrow=c(2,1))
+par(mar=c(3,5,3,3))
+ts.plot(intel[1:1731,4], gpars = list(xlab = "", ylab = "USD", main = "Intel"))
+par(mar=c(5,5,3,3))
+ts.plot(amd[1:1731,4], gpars = list(xlab = "Czas", ylab = "USD", main = "AMD"))
+```
+
+## Logarytm dziennych zwrotów z akcji Intela oraz AMD
+
+```{r, echo = FALSE, include=TRUE}
+par(mfrow=c(2,1))
+par(mar=c(3,5,3,3))
+ts.plot(intel_train, gpars = list(xlab = "", ylab = "Zwrot", main = "Intel"))
+par(mar=c(5,5,3,3))
+ts.plot(amd_train, gpars = list(xlab = "Czas", ylab = "Zwrot", main = "AMD"))
+```
+
+## Rozkład zwrotów
+```{r, echo = FALSE, include=TRUE}
+par(mfrow=c(2,1))
+par(mar=c(0,5,3,3))
+hist(intel_train, ylab="Intel", xlab="", ylim = c(0,350), main = "", xaxt="n", las=1 , col="#fc8d59",
+     breaks = 40, xlim = c(-0.3, 0.4))
+abline(v = 0, col = "#91cf60", lty = 2, lwd = 2)
+par(mar=c(5,5,0,3))
+hist(amd_train ,ylim = c(350,0), ylab="AMD", main = "",
+     breaks = 50, xlim = c(-0.3, 0.4),
+     xlab="Logarytm dziennych zwrotów", las=1 , col="#ffffbf")
+abline(v = 0, col = "#91cf60", lty = 2, lwd = 2)
+```
+
+## Intel - ACF i PACF
+
+```{r, echo = FALSE, include=TRUE}
+par(mfrow=c(2,1))
+par(mar=c(3,5,3,3))
+acf(intel_train, type = "correlation", main = "")
+par(mar=c(5,5,0,3))
+pacf(intel_train, main = "")
+```
+
+
+## AMD - ACF i PACF
+
+```{r, echo = FALSE, include=TRUE}
+par(mfrow=c(2,1))
+par(mar=c(3,5,3,3))
+acf(amd_train, type = "correlation", main = "")
+par(mar=c(5,5,0,3))
+pacf(amd_train, main = "")
+```
+
+
+## Testowanie autokorelacji
+
+```{r, echo = FALSE, include=FALSE}
+par(mfrow=c(2,1))
+par(mar=c(3,5,3,3))
+acf(amd_train, type = "correlation", main = "")
+par(mar=c(5,5,0,3))
+pacf(amd_train, main = "")
+```
+
+```{r, echo = FALSE, include=FALSE}
+lal1 <- round(Box.test(amd_train, type ="Box-Pierce")$p.value,3)
+lal2 <- round(Box.test(amd_train, type ="Ljung-Box")$p.value,3)
+lal3 <- round(Box.test(intel_train, type ="Box-Pierce")$p.value, 3)
+lal4 <- round(Box.test(intel_train, type ="Ljung-Box")$p.value,3)
+```
+
+
+             Box-Pierce      Ljung-Box
+--------   --------------   ----------------
+Intel       `r lal3`            `r lal4`
+AMD         `r lal1`            `r lal2`
+---------  --------------   ----------------
+Tabela: Wartości _p_ testów
+
+## Testowanie stacjonarności
+```{r, echo = FALSE, include=FALSE}
+lal1 <- round(unname(summary(ur.df(intel_train, type = "none" ,selectlags = "BIC"))@teststat),3)
+lal2 <- round(unname(summary(ur.kpss(intel_train))@teststat),3)
+lal3 <- round(unname(summary(ur.ers(intel_train))@teststat),3)
+lal4 <- round(unname(summary(ur.df(amd_train, type = "none" ,selectlags = "BIC"))@teststat),3)
+lal5 <- round(unname(summary(ur.kpss(amd_train))@teststat),3)
+lal6 <- round(unname(summary(ur.ers(amd_train))@teststat),3)
+```
+
+
+               ADF               KPSS                ERS
+--------   --------------   ----------------   ----------------
+Intel         `r lal1`         `r lal2`              `r lal4`
+AMD           `r lal3`         `r lal5`              `r lal6`
+---------  --------------   ----------------   ----------------
+Tabela: Wartość statystki testowej
+
+
+# Model ARMA
+
+## AMD - ARMA(1,1)
+```{r, echo = FALSE, include=FALSE}
+x <- arima(amd_train,order = c(1,0,1),  optim.control = list(maxit = 1000))
+lal1 <- arch.test(x, output = F) 
+```
+
+
+  - Brak autokorelacji reszt
+  - Reszty nie należą do rozkładu normlalnego
+
+`r knitr::kable(lal1, caption = "Test efektu Arch")`
+
+
+## Reszty AMD
+
+```{r, echo = FALSE, include=TRUE}
+plot(x$residuals)
+```
+
+## Prognoza zwrotów z akcji AMD
+
+```{r, echo = FALSE, include=TRUE}
+xyz <- as_tibble(forecast(x, level = 95, h = 30))
+colnames(xyz) <- c("Prognoza", "lw_sd", "up_sd")
+xyz <- xyz %>% mutate(Czas = 1:30) 
+amd_real <- tibble(Realizacja = as.vector(amd_test$daily.returns), Czas = 1:30, lw_sd = 0, up_sd = 0)
+
+koszmar <- c("Prognoza"="#d8b365","Realizacja"="#5ab4ac")
+ggplot(data=xyz, aes(x=Czas, y=Prognoza, ymin=lw_sd, ymax=up_sd)) + 
+  geom_line(aes(color = "Prognoza")) + 
+  geom_ribbon(alpha=0.2, color = "grey", fill = "#d8b365") + theme_bw() +
+  geom_line(aes(x= Czas, y = Realizacja, col ="Realizacja"), data = amd_real) +
+  scale_colour_manual(name="Prognoza",values=koszmar) +
+  theme(legend.position = "bottom") +
+  guides(color=guide_legend(title="")) +
+  ggtitle("Prognoza przy wykorzystaniu ARMA(1,1)") +
+  xlim(0,30)
+```
+
+
+## Intel - ARMA(3,2)
+
+```{r, echo = FALSE, include=FALSE}
+x <- arima(intel_train,order = c(3,0,2),  optim.control = list(maxit = 1000))
+lal1 <- arch.test(x, output = F) 
+```
+
+
+  - Brak autokorelacji
+  - Reszty nie należą do rozkładu normlalnego
+
+`r knitr::kable(lal1, caption = "Test efektu Arch")`
+
+
+## Reszty Intel
+
+```{r, echo = FALSE, include=TRUE}
+plot(x$residuals)
+```
+
+
+## Prognoza zwrotów z akcji Intela
+
+```{r, echo = FALSE, include=TRUE}
+xyz <- as_tibble(forecast(x, level = 95, h = 30))
+colnames(xyz) <- c("Prognoza", "lw_sd", "up_sd")
+xyz <- xyz %>% mutate(Czas = 1:30) 
+amd_real <- tibble(Realizacja = as.vector(intel_test$daily.returns), Czas = 1:30, lw_sd = 0, up_sd = 0)
+
+koszmar <- c("Prognoza"="#d8b365","Realizacja"="#5ab4ac")
+ggplot(data=xyz, aes(x=Czas, y=Prognoza, ymin=lw_sd, ymax=up_sd)) + 
+  geom_line(aes(color = "Prognoza")) + 
+  geom_ribbon(alpha=0.2, color = "grey", fill = "#d8b365") + theme_bw() +
+  geom_line(aes(x= Czas, y = Realizacja, col ="Realizacja"), data = amd_real) +
+  scale_colour_manual(name="Prognoza",values=koszmar) +
+  theme(legend.position = "bottom") +
+  guides(color=guide_legend(title="")) +
+  ggtitle("Prognoza przy wykorzystaniu ARMA(3,2)") +
+  xlim(0,30)
+```
+
+
+# GARCH
+
+## AMD
+
+```{r, echo = FALSE, include=TRUE, warning=FALSE}
+spec1 <- ugarchspec(variance.model = list(model = "sGARCH", garchOrder = c(1,1)),
+                    mean.model = list(armaOrder = c(0,0)), 
+                    distribution.model = "nig")
+spec2 <- ugarchspec(variance.model = list(model = "sGARCH", garchOrder = c(1,1)),
+                    mean.model = list(armaOrder = c(2,2)), 
+                    distribution.model = "std")
+spec3 <- ugarchspec(variance.model = list(model = "eGARCH", garchOrder = c(1,2)),
+                    mean.model = list(armaOrder = c(1,1)), 
+                    distribution.model = "std")
+spec4 <- ugarchspec(variance.model = list(model = "eGARCH", garchOrder = c(1,1)),
+                    mean.model = list(armaOrder = c(1,1)), 
+                    distribution.model = "std")
+
+
+tab_amd <- tibble(model = c("ARMA(0,0)-GARCH(1,1), ig", 
+                              "ARMA(2,2)-GARCH(1,2), t", 
+                              "ARMA(1,1)-eGARCH(1,2), t",
+                              "ARMA(1,1)-eGARCH(1,1), t"),
+                    Akaike = numeric(4),
+                    Bayes = numeric(4),  Shibata = numeric(4),
+                    H_Q = numeric(4))
+wynik_amd <- vector("list", 4)
+modele <- c(spec1, spec2, spec3, spec4)
+set.seed(123)
+for(i in 1:4) {
+  wynik_amd[[i]] <- ugarchfit(spec = modele[[i]], data = amd_train, solver.control = list(maxit = 1000))
+  tab_amd[i, "Akaike"] <- round(infocriteria(wynik_amd[[i]])[1],3)
+  tab_amd[i, "Bayes"] <- round(infocriteria(wynik_amd[[i]])[2],3)
+  tab_amd[i, "Shibata"] <- round(infocriteria(wynik_amd[[i]])[3],3)
+  tab_amd[i, "H_Q"] <- round(infocriteria(wynik_amd[[i]])[4],3)
+}
+```
+
+`r knitr::kable(tab_amd %>% arrange(Akaike), caption = "Podsumowanie")`
+
+## AMD - ARMA(1,1)-eGARCH(1,1)
+
+```{r, echo = FALSE, include=TRUE}
+plot(wynik_amd[[4]], which = 1)
+```
+
+## AMD - ARMA(1,1)-eGARCH(1,1)
+
+```{r, echo = FALSE, include=TRUE}
+plot(wynik_amd[[4]], which = 9)
+```
+
+## AMD - ARMA(1,1)-eGARCH(1,1)
+
+::: columns
+
+:::: column
+
+  `r knitr::kable(wynik_amd[[4]]@fit$matcoef[,c(1,4)], caption = "Standard error")`
+
+::::
+
+:::: column
+                               
+  `r knitr::kable(wynik_amd[[4]]@fit$robust.matcoef[,c(1,4)], caption = "Robust error")`
+
+::::
+
+:::
+
+
+  
+  
+
+## AMD - ARMA(1,1)-eGARCH(1,1)
+
+  - Adjusted Pearson Goodness-of-Fit Test
+  - Sign Bias Test
+  - Test stabilności Nybloma - H0 odrzucona (wspólny)
+  - Weighted ARCH LM Tests
+  - Weighted Ljung-Box Test on Standardized Squared Residuals
+  - Weighted Ljung-Box Test on Standardized Residuals
+
+## Intel - modele
+
+```{r, echo = FALSE, include=TRUE}
+spec1 <- ugarchspec(variance.model = list(model = "sGARCH", garchOrder = c(1,2)),
+                    mean.model = list(armaOrder = c(3,2)), 
+                    distribution.model = "std")
+spec2 <- ugarchspec(variance.model = list(model = "sGARCH", garchOrder = c(1,2)),
+                    mean.model = list(armaOrder = c(3,2)), 
+                    distribution.model = "sstd")
+spec3 <- ugarchspec(variance.model = list(model = "eGARCH", garchOrder = c(1,2)),
+                    mean.model = list(armaOrder = c(3,2)), 
+                    distribution.model = "std")
+tab_intel <- tibble(model = c("ARMA(3,2)-GARCH(1,2), t", 
+                              "ARMA(3,2)-GARCH(1,2), skew-t", 
+                              "ARMA(3,2)-eGARCH(1,2), t"),
+                    Akaike = numeric(3),
+                    Bayes = numeric(3),  Shibata = numeric(3),
+                    H_Q = numeric(3))
+wynik_intel <- vector("list", 3)
+modele <- c(spec1, spec2, spec3)
+for(i in 1:3) {
+  wynik_intel[[i]] <- ugarchfit(spec = modele[[i]], data = intel_train)
+  tab_intel[i, "Akaike"] <- round(infocriteria(wynik_intel[[i]])[1],3)
+  tab_intel[i, "Bayes"] <- round(infocriteria(wynik_intel[[i]])[2],3)
+  tab_intel[i, "Shibata"] <- round(infocriteria(wynik_intel[[i]])[3],3)
+  tab_intel[i, "H_Q"] <- round(infocriteria(wynik_intel[[i]])[4],3)
+}
+
+```
+
+
+
+`r knitr::kable(tab_intel %>% arrange(Akaike), caption = "Podsumowanie")`
+
+## Intel - ARMA(3,2)-eGARCH(1,2)
+
+```{r, echo = FALSE, include=TRUE}
+plot(wynik_intel[[3]], which = 1)
+```
+
+## Intel - ARMA(3,2)-eGARCH(1,2)
+
+```{r, echo = FALSE, include=TRUE}
+plot(wynik_intel[[3]], which = 9)
+```
+
+## Intel - ARMA(3,2)-eGARCH(1,2)
+
+
+::: columns
+
+:::: column
+
+  `r knitr::kable(wynik_intel[[3]]@fit$matcoef[,c(1,4)], caption = "Standard error")`
+
+::::
+
+:::: column
+                               
+  `r knitr::kable(wynik_intel[[3]]@fit$robust.matcoef[,c(1,4)], caption = "Robust error")`
+
+::::
+
+:::
+
+
+## Intel - ARMA(3,2)-eGARCH(1,2)
+
+
+  - Adjusted Pearson Goodness-of-Fit Test
+  - Sign Bias Test
+  - Test stabilności Nybloma
+  - Weighted ARCH LM Tests
+  - Weighted Ljung-Box Test on Standardized Squared Residuals - H0 odrzucona
+  - Weighted Ljung-Box Test on Standardized Residuals
+
+
+# VaR
+
+## Innowacje
+
+```{r, echo = FALSE, include=FALSE}
+margin_intel <- as.vector(residuals(wynik_intel[[3]], standardize = FALSE))
+margin_amd <- as.vector(residuals(wynik_amd[[4]], standardize = FALSE))
+lal1 <- round(mean(margin_intel), 3)
+lal2 <- round(mean(margin_amd), 3)
+lal3 <- round(var(margin_intel), 3)
+lal4 <- round(var(margin_amd), 3)
+lal5 <- round(skewness(margin_intel), 3)
+lal6 <- round(skewness(margin_amd), 3)
+lal7 <- round(kurtosis(margin_intel), 3)
+lal8 <- round(kurtosis(margin_amd), 3)
+```
+
+
+               Intel               AMD                
+--------   --------------   ----------------
+$\mu$           `r lal1`          `r lal2`
+$\sigma$        `r lal3`          `r lal4`
+Skośność        `r lal5`          `r lal6`
+Kurtoza         `r lal7`          `r lal8`
+---------  --------------   ----------------
+
+Korelacja Kendalla wynosi: `r cor(margin_intel,margin_amd, method = "kendall")`
+
+Wykres Cullena i Frey nie wskazuje, żeby brać pod uwagę inny rozkład prawdopodobieństwa niż t-studenta
+    
+
+## Intel - rozkład brzegowy
+
+
+```{r, echo = FALSE, include=FALSE}
+mydt <- function(x, m, s, df) dt((x-m)/s, df)/s
+shiftedt<-function(k,nu,mu,sigma){pt((k-mu)/sigma,df=nu)}
+intel_t <- fitness(margin_intel, mydt, start = list(m = 0, 
+                                                    s = 0.01, 
+                                                    df = 1))
+mIntel <- unname(intel_t$estimate[1])
+sIntel <- unname(intel_t$estimate[2])
+dfIntel <- round(unname(intel_t$estimate[3]),4)
+lal1 <- ks.test(margin_intel, "shiftedt",nu=dfIntel,mu=mIntel,sigma=sIntel)$p.value
+a <- seq(-0.1,0.1,0.001)
+```
+
+::: columns
+
+:::: column
+```{r, echo = FALSE, include=TRUE}
+temp<-Vectorize(function (a) dt((a-mIntel)/sIntel,df=dfIntel)/sIntel)
+hist(margin_intel,breaks = 40,probability=TRUE,main = "Histogram Intel",
+     xlab="Innowacje", ylab = "Gęstość",
+     ylim = c(0,40), col="tomato3")
+curve(temp, col="black", lwd=3,  add=TRUE)
+```
+::::
+
+:::: column
+                               
+--------   --------------
+df            `r dfIntel`
+KS test       `r lal1`
+---------  --------------
+::::
+
+:::
+
+## AMD - rozkład brzegowy
+
+```{r, echo = FALSE, include=FALSE}
+amd_t <- fitness(margin_amd, mydt, start = list(m = 0, 
+                                                    s = 0.01, 
+                                                    df = 1))
+mAmd <- unname(amd_t$estimate[1])
+sAmd <- unname(amd_t$estimate[2])
+dfAmd <- round(unname(amd_t$estimate[3]),4)
+ks.test(margin_amd, "shiftedt",nu=dfAmd,mu=mAmd,sigma=sAmd)
+
+```
+
+::: columns
+
+:::: column
+```{r, echo = FALSE, include=TRUE}
+temp2<-Vectorize(function (a) dt((a-mAmd)/sAmd,df=dfAmd)/sAmd)
+hist(margin_amd, breaks = 50, probability=TRUE,main = "Histogram AMD",
+     xlab="Innowacje", ylab = "Gęśtość",
+     ylim = c(0,20), col="tomato3")
+curve(temp2, col="black", lwd=3,  add=TRUE)
+lal1 <- ks.test(margin_amd, "shiftedt",nu=dfAmd,mu=mAmd,sigma=sAmd)$p.value
+```
+::::
+
+:::: column
+                               
+--------   --------------
+df            `r dfAmd`
+KS test       `r lal1`
+---------  --------------
+::::
+
+:::
+
+
+## Copula - pseudoobserwacje
+
+```{r, echo = FALSE, include=TRUE}
+plot(pobs(margin_amd), pobs(margin_intel),
+     ylab = "Intel", xlab = "AMD", main = "Pseudoobserwacje")
+```
+
+
+
+```{r, echo = FALSE, include=FALSE}
+p_AMD <- pt((margin_amd-mAmd)/sAmd, df = dfAmd)
+p_Intel <- pt((margin_intel-mIntel)/sIntel, df = dfIntel)
+cop_selcted <- BiCopSelect(p_AMD, p_Intel, familyset = NA, selectioncrit = "BIC",
+                           rotations = TRUE, method = "mle")
+```
+
+```{r, echo = FALSE, include=FALSE}
+rot_cop <- rotCopula(gumbelCopula(dim = 2), flip = TRUE) # 180 stopni
+copula_surv <- fitCopula(rot_cop, data = as.matrix(cbind(p_AMD,p_Intel)), method ="ml")
+simCop <- rotCopula(gumbelCopula(dim = 2, param = copula_surv@estimate), flip = TRUE)
+simMvd <- mvdc(copula=simCop, margins=c("t", "t"),
+               paramMargins=list(list(df = dfIntel), 
+                                 list(df=dfAmd)) )
+
+```
+
+## Survival Gumbell (`r round(copula_surv@estimate,3)`)
+
+```{r, echo = FALSE, include=TRUE}
+contour(simCop, dCopula, xlim = c(0, 1), ylim=c(0, 1), main = "Survival Gumbel")
+```
+
+
+## Symulacja - czy to zadziała?
+
+```{r, echo = FALSE, include=TRUE, warning=FALSE}
+wiz_sim <- rMvdc(1731, simMvd)
+colnames(wiz_sim) <- c("Intel", "AMD") 
+wiz_sim <- as_tibble(wiz_sim)
+wiz_sim <- wiz_sim %>% mutate(Intel =Intel*sIntel+mIntel,
+                              AMD = AMD*sAmd+mAmd)
+# Wizualizacja innowacji - zielony to jest symulacja
+temp3 <- tibble(real_AMD = as.numeric(margin_amd), real_Intel = as.numeric(margin_intel),
+            sim_AMD = wiz_sim$AMD, sim_Intel = wiz_sim$Intel)
+temp3 %>% ggplot(aes(x= real_AMD, y = real_Intel)) +
+  geom_point(color = "#af8dc3", alpha = 1) + theme_bw() +
+  geom_point(aes(x = sim_AMD, y = sim_Intel), color = "#7fbf7b", alpha = 0.3) +
+  xlab("AMD") + ylab("Intel") +
+  xlim(-0.2,0.2) +
+  ylim(-0.1,0.1) +
+  ggtitle("Rzeczywistość a symulacja innowacji")
+```
+
+
+## Symulacja - czy to zadziała?
+
+```{r, echo = FALSE, include=TRUE}
+sim_GARCH <- rMvdc(10000, simMvd)
+# Pierwszy jest intel drugi amd
+sim_GARCH[,1] <- sim_GARCH[,1] * sIntel + mIntel
+sim_GARCH[,2] <- sim_GARCH[,2] * sAmd + mAmd
+tab_par <- tibble(mu = c(mIntel, mAmd),
+               s = c(sIntel, sAmd),
+              df = c(dfIntel, dfAmd))
+testowanie2 <- sapply(1:2, function(j) sqrt((tab_par[[j,3]]-2)/tab_par[[j,3]]) * sim_GARCH[,j])
+
+sim_GARCH2 <- lapply(1:2, function(j)
+  ugarchsim(list(wynik_intel[[3]], wynik_amd[[4]])[[j]], 
+            n.sim = 10000, m.sim = 1,
+            custom.dist = list(name = "sample",
+                               distfit = testowanie2[,j, drop = FALSE])))
+matplot(fitted(sim_GARCH2[[2]]), type = "l", xlab = "t", main = "AMD", ylab = "")
+```
+
+## Symulacja - czy to zadziała?
+```{r, echo = FALSE, include=TRUE}
+matplot(fitted(sim_GARCH2[[1]]), type = "l", xlab = "t", ylab = "", main = "Intel")
+```
+
+
+## Value at Risk
+
+
+```{r, echo = FALSE, include=FALSE}
+VaR_amd <- tibble(VaR = numeric(1000))
+
+
+for(i in 1:1000){
+  sim_AMD <- rMvdc(10000, simMvd)
+  sim_AMD[,2] <- (sim_AMD[,2] * sAmd + mAmd)*sqrt((dfAmd-2)*dfAmd)
+  sim_AMD_VAR <- ugarchsim(wynik_amd[[4]],
+                       n.sim = 10000,
+                       m.sim = 1,
+                       custom.dist = list(name = "sample",
+                                          distfit = sim_AMD[,2, drop = FALSE])
+  )
+  VaR_amd[i,1] <-  sort(fitted(sim_AMD_VAR))[10000*0.01]
+}
+ostateczny <- mean(VaR_amd$VaR)
+
+
+```
+
+  - Tylko AMD
+  - Symulacja Monte Carlo (1000 po 10 000 obserwacji)
+  - W każdje symulacji jest wybierany pierwszy percentyl
+  - Średnia pierwszych percentylach daje VaR 1%
+  - VaR 1% wynosi: `r ostateczny`
+
+
+
+
+
+
+

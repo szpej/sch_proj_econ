@@ -1,0 +1,418 @@
+---
+title: "Optymalizacja portfela za pomocą kopuły"
+author: "Kyrylo Mordan i Paweł Stąpyra"
+output:
+  pdf_document: default
+  html_notebook: default
+---
+
+```{r message=FALSE, warning=FALSE, echo=FALSE, include=F}
+library(tidyverse)
+library(quantmod)
+library(copula)
+library(ggplot2)
+library(tidyr)
+library(gridExtra)
+library(data.table)
+library(parallel)
+library(dplyr)
+# Wymagana paczka import w zainstalowanych paczkach
+import::from(e1071, skewness)
+import::from(e1071, kurtosis)
+import::from(fitdistrplus, descdist)
+import::from(fitdistrplus, fitdist)
+import::from(MASS, fitness = fitdistr)
+import::from(VineCopula,BiCopSelect)
+```
+
+# Pobranie danych
+
+```{r message=FALSE, warning=FALSE, echo=TRUE}
+start<-format(as.Date("2020-01-01"),"%Y-%m-%d")
+end<-format(as.Date("2021-12-31"),"%Y-%m-%d")
+
+Amazon<-getSymbols('AMZN', src= "yahoo", from=start, to=end, auto.assign = F)
+Google<-getSymbols('GOOG', src= "yahoo", from=start, to=end, auto.assign = F)
+findat <- data.frame(index = index(Amazon), amazon = Amazon[,4], google = Google[,4])
+
+```
+
+# Wizualizacja serii czasowej
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(findat,aes(x=index)) + 
+  geom_line(aes(y=AMZN.Close,colour="Amazon")) +
+  geom_line(aes(y = GOOG.Close,colour="Google")) + 
+  scale_color_manual(values=c("#9999CC","#CC6666" )) +
+  xlab("Data") +
+  ylab("Cena zamknięcie") + 
+  ggtitle("Ceny akcji wybranych spółek w period od początku 2020 do końca 2021")
+```
+
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+Return_A <- as.vector(dailyReturn(Amazon, leading = FALSE) ) # as.vector, bo inaczje mamy obiekt xts
+Return_G <- as.vector(dailyReturn(Google, leading = FALSE)) # FALSE uniemożliwa imputację pierwszej i ostatniej obserwacji
+Return_A <- Return_A[!is.na(Return_A)]
+Return_G <- Return_G[!is.na(Return_G)]
+```
+
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+log_A <- as.vector(dailyReturn(Amazon, leading = FALSE, type = "log") )
+log_G <- as.vector(dailyReturn(Google, leading = FALSE, type = "log"))
+log_A <- log_A[!is.na(log_A)]
+log_G <- log_G[!is.na(log_G)]
+```
+
+Sprawdzamy czy zwroty są obliczane na bazie ceny zamknięcia. Oczekujemy wartości TRUE.
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+data.frame(
+
+zwrot = c(identical(
+  round(Return_A[100],8), 
+  round((as.numeric(Amazon$AMZN.Close[101])-as.numeric(Amazon$AMZN.Close[100]))/as.numeric(Amazon$AMZN.Close[100]),8)
+  ),identical(
+  round(Return_G[100],8), 
+  round((as.numeric(Google$GOOG.Close[101])-as.numeric(Google$GOOG.Close[100]))/as.numeric(Google$GOOG.Close[100]),8)
+  )),
+
+log_zwrot = c(identical(log(as.numeric(Amazon[2:5,4])/as.numeric(Amazon[1:4,4])), log_A[1:4]),
+              identical(log(as.numeric(Google[2:5,4])/as.numeric(Google[1:4,4])), log_G[1:4])),
+row.names = c("Amazon","Google")
+
+) %>% knitr::kable()
+```
+
+# Wizualizacja zwykłego zwrotu
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+returndat0 <- data.frame(amazon = Return_A, google = Return_G)
+
+returndat <-  gather(returndat0,key = "company",value = "return")
+```
+
+
+Oba wykresy wyglądają mnie więcej symetrycznie, co sugeruje, że skośność może być bliska zeru
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+h1 <- ggplot(subset(returndat,company=="amazon")) + geom_histogram(aes(return,fill="Amazon"),binwidth = 0.01) + theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(), legend.position = "none") + ylab("Amazon") + scale_fill_manual(values=c("#9999CC")) + xlim(-.2,0.2) + ylim(0,150) + 
+  ggtitle("Histogramy zwykłych zwrotów wybranych spółek")
+h2 <- ggplot(subset(returndat,company=="google")) + geom_histogram(aes(return,fill="Google"),binwidth = 0.01) +
+ scale_y_reverse(limits = c(150,0)) + ylab("Google") + theme(legend.position = "none") + scale_fill_manual(values=c("#CC6666")) + xlim(-.2,0.2)
+
+grid.arrange(h1,h2,ncol=1) 
+```
+
+#  Badanie rozkładów brzegowych 
+
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+shapiro.test(Return_G)
+shapiro.test(Return_A)
+```
+ odrzucamy w obu przypadkach H0, że to dane obserwacje pochodzą z rozkładu normalnego. 
+
+
+## Momenty rozkładu
+
+Rozkład obu spółek są leptokurtyczne, co jest raczej typowe dla zwrotów z akcji, a skośność jest bliska zero w oba przypadkach jak wskazywał poprzedni wykres. 
+
+
+```{r echp = FALSE}
+data.frame(
+skewness = c(skewness(Return_A),
+                skewness(Return_G) 
+                ), 
+kurtosis = c(kurtosis(Return_A), 
+                kurtosis(Return_G)),
+mean = c(mean(Return_A),
+         mean(Return_G)
+         ),
+sd = c(sd(Return_A),
+       sd(Return_G)),row.names = c("amazon","google")
+) %>% knitr::kable(digits=4)
+```
+
+
+### Wykres Cullena i Freya
+Używamy bootstrap, bo ponoć wyższe momenty są bardzo wrażliwe na dane.
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+descdist(Return_A, discrete = FALSE, boot = 500)
+descdist(Return_G, discrete = FALSE, boot = 500)
+```
+Leptokurtyczny rozkład Google jest bliższy do logistycznego, nie ma to miejsce w przypadku Amazon.
+Zatem nasze rozkłady mają grube ogony, są symetryczne oraz mają wartości pozytywne i negatywne
+zatem rozkłady do sprawdzenia: t-studenta i logistyczny (Google)
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+dmydt <- function(x, m, s, df) dt((x-m)/s, df)/s
+
+pmydt <- function(q, df=1, m=0, s=1)  pt((q - m)/s, df)
+
+qmydt <- function(p, df=1, m=0, s=1)  qt(p, df)*s + m
+```
+
+
+# Sprawdzenie rozkładów brzegowych dla spółek 
+
+## Google
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+Google_t <- fitdist(Return_G, distr = "mydt",start = list(m=1,s=1,df = 1), method = "mle", keepdata = TRUE, discrete = FALSE)
+z.google <- fitdist(Return_G, distr = "logis", method = "mle", keepdata = TRUE, discrete = FALSE)
+
+data.frame(
+  t = c(Google_t$aic,
+        Google_t$bic), # bardzo zły wynik
+  logis = c(z.google$aic, # najlepszy
+        z.google$bic), 
+  row.names = c("aic","bic")
+) %>% knitr::kable(digits = 3)
+```
+
+
+
+Wizualzacja poszczególnych rozkładów teoretycznych do empirycznych
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+plot(z.google) # środek ok, ogony lepsze, ale nadal odstają
+# Z t studentem jest więcej zachodu, bo trzeba wszystko samemu robić
+
+mGG <- unname(Google_t$estimate[1]) 
+sGG <- unname(Google_t$estimate[2])
+dfGG <-round(unname(Google_t$estimate[3])) # estymowane stopnie swobody
+
+plot(Google_t)
+```
+
+### Test Komogorova-Smirnova
+
+Biorąc pod uwagę test KS, nie ma podstaw do odrzucenia H0 o tym, że rozkład zwrotów Google
+nie  należy do rozkładu t-studenta. Niepojące są wartości empiryczne w ogonach, które odbiegają od teoretecznych w obu przypadkach (QQ plot powyżej). Ale rozkład t-studenta bardziej pasuje, bo dla 10% odrzucamy logistyczny w teście KS.
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+ks.test(Return_G, "plogis", unname(z.google$estimate[1]), unname(z.google$estimate[2])) # jest ok
+
+ks.test(Return_G, "pmydt",df=dfGG,m=mGG,s=sGG)
+```
+
+
+## Amazon
+
+W przypadku Amazona zastosowaliśmy tą samą procedurę i stwierdziliśmy, że rozkład t studenta 
+jest dobrą podstawą do modelowania. Ogółem w Amazonie jest  podobna sytuacja tylko, że QQ plot dla
+t-studenta nie na takich dużych ogonów. Test KS nie pozwala odrzucić H0 dla obu rozkładów.
+
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+z.amazon <- fitdist(Return_A, distr = "logis", method = "mle", keepdata = TRUE, discrete = FALSE)
+AMZN_t <- fitdist(Return_A, distr = "mydt",start = list(m=1,s=1,df = 1), method = "mle", keepdata = TRUE, discrete = FALSE)
+
+data.frame(
+  logis = c(z.amazon$aic,
+        z.amazon$bic), 
+  t = c(AMZN_t$aic, # najlepszy
+       AMZN_t$bic),  # najlepszy
+  row.names = c("aic","bic")
+) %>% knitr::kable(digits = 3,caption = "Kryteria informayjne")
+
+```
+
+### Test Komogorova-Smirnova
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+mAM <- unname(AMZN_t$estimate[1])
+sAM <- unname(AMZN_t$estimate[2])
+dfAM <- round(unname(AMZN_t$estimate[3]),2)
+```
+
+### Wizualzacja rozkładów teoretycznego i emprirycznego
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+plot(z.amazon) # środek ok. brdzydki jeden ogon
+
+plot(AMZN_t)
+```
+
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+ks.test(Return_A, "pmydt",df=dfAM,m=mAM,s=sAM)
+ks.test(Return_A, "plogis", unname(z.amazon$estimate[1]), unname(z.amazon$estimate[2]))
+```
+
+
+
+
+#  Badanie zależności 
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+plot(Return_A,Return_G,xlab="Amazon",ylab="Google",main="Stopa dziennych zwrotów")
+```
+
+Korelacja Kendala wyniosła `r cor(Return_A, Return_G, method = "kendall")`. Używamy jej 
+ze względu na to, że nie zaleca się stosowania korelacji Pearsona w kopułach.
+
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+x <- ecdf(Return_A)(Return_A)
+y <- ecdf(Return_G)(Return_G)
+plot(x,y,xlab="Amazon",ylab="Google",main="Empiryczna dystrybuanta stopy dziennych zwrotow")
+```
+
+Silniejsza zależność w negatywnym ogonie i duża korelacja Kendala wskazuje na spadkach i wzrostach dla obu spółek na rynku, prawdopobniej przez to że to jest jedna branża na rynku.
+
+
+## Automatyczna selekcja empirycznej copuly (dwa sposoby)
+```{r warning=FALSE}
+cop_selcted <- BiCopSelect(pobs(Return_A), pobs(Return_G), familyset = NA, selectioncrit = "BIC",
+                           rotations = TRUE, method = "mle")
+cop_selcted  
+cop_selcted <- BiCopSelect(pobs(Return_A), pobs(Return_G), familyset = NA, selectioncrit = "BIC",
+                           rotations = TRUE, method = "itau") 
+cop_selcted 
+```
+
+
+Pseudo obserwacje do empirycznej kopuły, w celu zobaczenia czy 
+funkcja z copula wskaże ten sam parametr.
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+emp_G <- pobs(Return_G)
+emp_A <- pobs(Return_A)
+```
+
+Sprawdzenie czy rzeczywiście obrócona kopuła jest lepsza od zwykłej.
+
+```{r }
+copula_test <- fitCopula(gumbelCopula(dim = 2), data = as.matrix(cbind(emp_G,emp_A)), method ="ml")
+rot_cop <- rotCopula(gumbelCopula(dim = 2), flip = TRUE) # 180 stopni
+copula_surv <- fitCopula(rot_cop, data = as.matrix(cbind(emp_G,emp_A)), method ="ml")
+```
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+data.frame(
+test = AIC(copula_test),
+surv = AIC(copula_surv) 
+) %>% knitr::kable(digits = 4)
+```
+
+## Test goodness of fit dla kopuły 
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+test <- gofCopula(rot_cop, as.matrix(as.matrix(cbind(Return_A,Return_G)), N = 50))
+test
+```
+
+Nie ma podstaw odrzucenia H0 na podstawie testu, czyli o kopule Gumbela odwróconej o 180 stopni.
+
+Bardzo podobne estymowane parametry.
+
+Parametry kopuły, obliczone za pomocą dwóch różnych paczek
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+data.frame(
+"VineCopula" = cop_selcted$par,
+"copula" = copula_surv@estimate, row.names = ""
+) %>% knitr::kable(digits = 6)
+```
+Przyjeliśmy uproszczennie, szacowaliśmy copuły na pseudobserwacjach zamaist dziłać na dystrybuancie t-studenta.
+
+#  VaR
+
+ 
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+simCop <- rotCopula(gumbelCopula(dim = 2, param = copula_surv@estimate), flip = TRUE)
+simCop
+```
+
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+simMvd <- mvdc(copula=simCop, margins=c("t", "t"),
+              paramMargins=list(list(df = dfAM), 
+                                list(df=dfGG)) )
+
+
+wiz_sim <- rMvdc(503, simMvd) # 503 - korekta dla t-studenta
+colnames(wiz_sim) <- c("Amazon", "Google") 
+```
+
+
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+wiz_sim <- as_tibble(wiz_sim)
+wiz_sim <- wiz_sim %>% mutate(Amazon= Amazon*sAM+mAM,
+                                Google = Google*sGG+mGG)
+```
+
+
+```{r message=FALSE, warning=FALSE, echo=FALSE} 
+x <- tibble(Amazon = as.numeric(Return_A), Google = as.numeric(Return_G),
+       sim_amazon = wiz_sim$Amazon, sim_google = wiz_sim$Google)
+x %>% ggplot(aes(x= Amazon, y = Google)) +
+  geom_point(color = "grey", alpha = 0.5) + theme_bw() +
+  geom_point(aes(x = sim_amazon, y = sim_google), color = "blue", alpha = 0.5) +
+  ggtitle("Zwroty z akcji, symulaja i rzeczywiste")
+
+```
+
+Na podstawie wyresu można stwierdzić, że założony wielowymiarowy rozkład, który powstał z kopuły survival gumbel oraz rozkładów t-studenta dobrze wyjaśnia zmienność zwrotów empirycznych.
+
+Chcemy zainwestować w portfel akcji składający się z akcji Google i Amazona. Chcemy, żeby ryzyko było jak najniższe, tj. jesteśmy zainteresowani VAR 1%. Ponieważ liczymy VAR 1% na podstawie symulacji to jesteśmy też zainteresowani, żeby jego wariancja była też jak najniższa.
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+udzialy = seq(0.01,0.99,by=0.01)
+
+wyniki <- list(rep(NA,length(udzialy)))
+
+n = 10^5
+
+
+for(j in 1:length(udzialy)){
+
+wA = udzialy[j]
+wG <- 1-wA
+
+
+perc <-  unlist(mclapply(1:10,function(i){
+  set.seed(i)
+  sim_return <-rMvdc(n, simMvd) 
+  sim_return[,1] <- sim_return[,1]*sAM+mAM
+  sim_return[,2] <- sim_return[,2]*sGG+mGG
+  sort(sim_return %*% c(wA, wG))[n*0.01]
+},mc.cores = 10))
+
+wyniki[[j]] <- list(mean = mean(perc),
+var = var(perc), sd = sd(perc))
+
+}
+
+```
+
+
+```{r message=FALSE, warning=FALSE, echo=FALSE} 
+res <- lapply(1:length(wyniki), function(i){
+  data.frame(mean = wyniki[[i]]$mean,var = wyniki[[i]]$var,sd = wyniki[[i]]$sd  )
+})
+
+resdt <- rbindlist(res)
+```
+
+
+# *Wnioski*
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+suppressWarnings(
+ggplot(resdt,aes(x = mean, y= var)) + geom_point() +
+  geom_smooth(method="lm",se=F) +
+  ggtitle("Zależność pomiędzy średnią a wariancją w symulowanym portfelu "))
+
+```
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+opts_v <- which.min(resdt$var) 
+
+opts_m <- which.max(resdt$mean)
+```
+
+
+Maksymalna średnia przy minimalizowanej wariancji w przeprowadzonej symulacji występuje dla udziały Amazon'a na poziomie `r udzialy[opts_v]` i Google `r 1-udzialy[opts_v]`. Ogólnie można by było zauważyć lepszy wyniki przy większych udziałach akcji spółki Amazon.
+
