@@ -1,0 +1,725 @@
+---
+title: "Dwóch detektywów"
+author: "Paweł Stąpyra"
+date: "6 02 2022"
+output: html_document
+fig_caption: yes
+indent: true
+---
+<style type="text/css">
+.main-container {
+  max-width: 1400px;
+  margin-left: auto;
+  margin-right: auto;
+}
+</style>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r paczki, include=FALSE}
+library(gutenbergr)
+data("stop_words")
+library(tidymodels)
+library(tidytext)
+library(jsonlite)
+library(stringr)
+library(wordcloud2)
+library(igraph)
+library(ggraph)
+library(widyr)
+library(topicmodels)
+library(webshot)
+library(htmlwidgets)
+set.seed(123)
+sherlock <- readRDS(file = "sherlock_temp.Rdata")
+poirot <- readRDS(file = "poirot_temp.Rdata")
+```
+
+```{r wrangling, include=FALSE}
+# Przypisanie tytułu
+comp_id <- function(x, detective = c("Sherlock", "Poirot")){
+  if(detective == "Sherlock"){
+    y <- c("The Memoirs of Sherlock Holmes" = 834,
+           "The Return of Sherlock Holmes" = 108,
+           "Adventures of Sherlock Holmes" = 48320,
+           "The Hound of the Baskervilles" = 3070)
+    book_title <- names(y[x == y])
+  } else {
+    y <- c("The Hunter's Lodge Case" = 67160,
+           "The Mysterious Affair" = 863,
+           "The Murder on the Links" = 58866,
+           "Poirot Investigates" = 61262,
+           "The Plymouth Express Affair" = 66446,
+           "The Missing Will" = 67173)
+    book_title <- names(y[x == y])
+  }
+    book_title
+  }
+
+sherlock$book <- sapply(sherlock$gutenberg_id, FUN = comp_id, detective = "Sherlock")
+poirot$book <- sapply(poirot$gutenberg_id, FUN = comp_id, detective = "Poirot")
+
+# Przypisanie numeru wersa
+tidy_sherlock <-
+  sherlock %>%
+  group_by(book) %>%
+  mutate(linenumber = row_number()) %>%
+  ungroup()
+tidy_poirot <-
+  poirot %>%
+  group_by(book) %>%
+  mutate(linenumber = row_number()) %>%
+  ungroup()
+
+# Tokenizacja inigram
+tidy_sherlock <- tidy_sherlock %>%
+  unnest_tokens(output = word,input = text, token = "words", to_lower = TRUE, drop = FALSE) %>%
+  mutate(word = str_extract(word, "[a-z']+")) 
+tidy_sherlock[1:2] <- NULL
+tidy_sherlock$author <- "Artur Conan Doyle"
+
+tidy_poirot <- tidy_poirot %>%
+  unnest_tokens(output = word,input = text, token = "words", to_lower = TRUE, drop = FALSE) %>%
+  mutate(word = str_extract(word, "[a-z']+")) 
+tidy_poirot[1:2] <- NULL
+tidy_poirot$author <- "Agatha Christie"
+
+my_stop_words <- rbind(stop_words, tibble(word = "don’t", lexicon = "my"))
+tidy_poirot <- tidy_poirot %>%
+  anti_join(my_stop_words)
+tidy_sherlock <- tidy_sherlock %>%
+  anti_join(my_stop_words)
+
+together <- rbind(tidy_poirot, tidy_sherlock)
+together <- drop_na(together)
+
+
+### do 2-gram
+bi_poirot <-
+  poirot %>%
+  mutate(text = str_replace_all(.$text, pattern = "_", replacement = " ")) %>%
+  group_by(book) %>%
+  mutate(linenumber = row_number()) %>%
+  ungroup()
+bi_poirot <- bi_poirot %>%
+  unnest_tokens(output = bigram ,input = text, token = "ngrams", n = 2,
+                to_lower = TRUE, drop = FALSE)
+bi_poirot[1:2] <- NULL
+bi_poirot$author <- "Agatha Christie"
+
+
+bi_sherlock <-
+  sherlock %>%
+  mutate(text = str_replace_all(.$text, pattern = "_", replacement = " ")) %>%
+  group_by(book) %>%
+  mutate(linenumber = row_number()) %>%
+  ungroup()
+bi_sherlock <- bi_sherlock %>%
+  unnest_tokens(output = bigram ,input = text, token = "ngrams", n = 2,
+                to_lower = TRUE, drop = FALSE)
+bi_sherlock[1:2] <- NULL
+bi_sherlock$author <- "Artur Conan Doyle"
+
+bi_sherlock <- drop_na(bi_sherlock)
+bi_poirot <- drop_na(bi_poirot)
+
+
+bi_conan <- bi_sherlock %>%
+  separate(bigram, c("word1", "word2"), sep = " ")  %>%
+  filter(!word1 %in% stop_words$word) %>%
+  filter(!word2 %in% stop_words$word) %>%
+  count(author, word1, word2, sort = TRUE) %>%
+  ungroup() %>%
+  unite(bigram, word1, word2, sep = " ")
+bi_agata <- bi_poirot %>%
+  separate(bigram, c("word1", "word2"), sep = " ")  %>%
+  filter(!word1 %in% stop_words$word) %>%
+  filter(!word2 %in% stop_words$word) %>%
+  count(author, word1, word2, sort = TRUE) %>%
+  ungroup() %>%
+  unite(bigram, word1, word2, sep = " ")
+
+bi_together <- 
+  inner_join(bi_conan, bi_agata, by = "bigram")  %>% select(bigram)
+bi_together <- rbind(bi_conan %>% filter(bigram %in% bi_together$bigram),
+                     bi_agata %>% filter(bigram %in% bi_together$bigram))
+
+
+# do topic modelling - przypisanie rozdziałów
+chapter_creation <- function(x, y = NULL) {
+  if(is.null(y)){
+    (str_detect(x, pattern = regex("^chapter ", ignore_case = TRUE)) &  str_length(x) <= 15)
+  } else {
+    x_ind <- str_remove(str_trim(x[y]), pattern = "[\\t]")
+    x_ind <- str_c(x_ind, collapse = "|")
+    x <- str_detect(x, regex(x_ind, ignore_case = TRUE))
+    x[y] <- FALSE
+    x
+  }
+}
+
+temp <- sherlock %>% 
+  select(-gutenberg_id) %>%
+  filter(book =="The Memoirs of Sherlock Holmes")
+temp$chapter <- str_c("Chapter ", cumsum(chapter_creation(temp$text,17:28)))
+temp <- bind_rows(temp, 
+                  sherlock[sherlock$book == "The Return of Sherlock Holmes", c("text", "book")])
+temp[temp$book == "The Return of Sherlock Holmes", "chapter"] <- 
+  str_c("Chapter ", 
+        cumsum(chapter_creation(
+          temp$text[temp$book == "The Return of Sherlock Holmes"], 16:28)))
+temp <- bind_rows(temp, 
+                  sherlock[sherlock$book == "The Hound of the Baskervilles", c("text", "book")])
+temp[temp$book == "The Hound of the Baskervilles", "chapter"] <- 
+  str_c("Chapter ", 
+        cumsum(chapter_creation(
+          temp$text[temp$book == "The Hound of the Baskervilles"],)))
+temp <- bind_rows(temp, 
+                  poirot[poirot$book %in%
+                           c("The Hunter's Lodge Case", 
+                             "The Plymouth Express Affair",
+                             "The Missing Will"),
+                         c("text", "book")])
+temp <- replace_na(temp, replace = list(chapter = "Chapter 1"))
+temp <- bind_rows(temp, 
+                  poirot[poirot$book == "The Murder on the Links", c("text", "book")])
+temp[temp$book == "The Murder on the Links", "chapter"] <- 
+  str_c("Chapter ", 
+        cumsum(chapter_creation(
+          temp$text[temp$book == "The Murder on the Links"], 23:50
+          )))
+temp <- bind_rows(temp, 
+                  poirot[poirot$book == "The Mysterious Affair", c("text", "book")])
+temp[temp$book == "The Mysterious Affair", "chapter"] <- 
+  str_c("Chapter ", 
+        cumsum(chapter_creation(
+          temp$text[temp$book == "The Mysterious Affair"]
+        )))
+
+x <- poirot %>% filter(book == "Poirot Investigates" ) %>% .$text
+x_ind <- sub(".*? ", "", str_trim(x[seq(44,64, by = 2)]))
+x_ind <- str_detect(x, regex(str_c(x_ind, collapse = "|"), ignore_case = TRUE))
+x_ind[seq(44,64, by = 2)] <- FALSE
+temp <- bind_rows(temp, 
+                  poirot[poirot$book == "Poirot Investigates", c("text", "book")])
+temp[temp$book == "Poirot Investigates", "chapter"] <- 
+  str_c("Chapter ", cumsum(x_ind))
+```
+
+
+
+## Opis danych
+
+Surowe dane są to książki. Trzy książki autorstwa Arthura Ignatiusa Conana Doyla oraz sześć 
+dzieł Agathy Mary Clarissy Miller Christie. W przypadku A.C.Doyla dziełami tymi są 
+_The Memoirs of Sherlock Holmes_, 
+_The Return of Sherlock Holmes_, _The Hound of the Baskervilles_, z czego dwie pierwsze pozycje 
+to zbiory opowiadań. W przypadku A.Christie jest to sześć książek: _The Hunter's Lodge Case"_, 
+_The Mysterious Affair_, _The Murder on the Links_, _Poirot Investigates_, _The Plymouth Express Affair_,
+_The Missing Will_. Są to zarówno krótkie nowele, zbiory opowiadań jak i powieść. Jak można 
+zauważyć są to dzieła dotyczące dwóch najsłynniejszych literackich detektywów. Dane zostały pobrane za 
+pomocą funkcji `gutenberg_download`, która pobiera książki ze strony Projektu Gutenberg, 
+projektu, który polega na udostępnianiu książek w formie e-booków (czasem też 
+audiobooków), których prawa autorskie już wygasły (około 95 letnie dzieła). Pobrane dane te zawierają 
+id odnoszące się do tytułu oraz poszczególnie wersy tekstu. W celu poddania tych książek 
+analizie róznym analizom, należało dokonać różnych przekształceń:
+
+
+  * Częstość występowania słów:
+  
+    - przypisanie autora oraz tytułu,
+    - numeracja wersów,
+    - tokenizacja pojedynczych słów (unigram) - doprowadzenie do takiej sytuacji, żeby 
+     zmienna była pojedynczym słowem,
+    - transformacja słów, tak żeby składały sie tylko z małych literek,
+    - wydobycie ciągów, ktore składają się tylko z "[a-z]+"
+    - usunięcie stop-słów
+    
+  * Analiza powiązań:
+  
+    - przypisanie autora oraz tytułu,
+    - numeracja wersów,
+    - tokenizacja 2-gram - zmienna to 2 słowa, oddzielone spacją. W zależności od 
+    potrzeb ta zmienna była dzielona na dwie zmienne każda zawierająca pojedyncze słowo,
+    - zastąpięnie podkreslnika spacją,
+    - usunięcie tych obserwacji, które zawierają stop-słowo w pierwszym lub drugim 
+    wyrazie.
+    
+  * Analiza sentymentu:
+    - te same kroki co w częstości występowania słów,
+    - przypisanie wartości sentymentu do wybranych słów,
+    - obliczenie wartości sentymentu dla wybranego okna akcji,
+    - wzięcie poprawki w wartościach sentymentu ze względu na słowa, które negują, 
+    tj. _not_, _no_, _never_, _without_.
+    
+  * Latent Dirichlet Allocation:
+    - stworzenie nowej zmiennej (chapter) - na podstawie informacji zawartych w książce. 
+    Będzie ona pełniła rolę dokumentu w LDA.
+    - tokenizacja unigram,
+    - wydobycie ciągów, ktore składają się tylko z "[a-z]+"
+    - usunięcie słow: _sherlock holmes_, _hercules poirot_ oraz _watson_ w celu utrudnienia
+    działania algorytmowi
+    
+# Częstość występowania słów
+
+  Dobrym wstępem do analizy tekstu jest zoobrazowanie najczęściej używanych słów 
+przez danego autora albo w danym dokumencie.W przypadku A.C.Doyla oraz A.Christie 
+okazało się, że część, wśród najczęściej przez nich używanych słów, jest taka sama. Oczywiście 
+pierwsze miejsca są zajęte przez głównych bohaterów. Najbardziej zaskakującą pozycja są drzwi. 
+Nie znam aż tak dobrze prozy dotyczącej Poirota, jednak w przypadku Sherlocka jest to częściowo 
+zrozumiałe. Wiele jego przygód zaczyna  w momencie, gdy zrozpaczony klient 
+wchodzi do jego biura. Być może większa ilość słówa noc w przypadku Sherlocka jest 
+związane z _Psem Baskerville'ów_, gdzie akcja działa się nocą.
+\newline
+
+
+```{r wykres1, echo=FALSE, fig.cap="Wykres 1", warning=FALSE, message = FALSE, out.width="100%"}
+anty_author <- tidy_poirot %>%
+  count(word, sort = TRUE) %>%
+  slice(1:20) %>%
+  semi_join(tidy_sherlock %>% count(word, sort = TRUE) %>%
+              slice(1:20), by = "word") %>%
+  mutate(razem = "jest") %>%
+  select(word, razem)
+
+
+together %>% 
+  group_by(author) %>%
+  count(word, sort = TRUE) %>%
+  filter(n > 150) %>%
+  mutate(word = reorder(word, n)) %>%
+  slice(1:20) %>%
+  ungroup() %>%
+  left_join(anty_author) %>%
+  mutate(razem = ifelse(is.na(razem), "nie ma", razem)) %>%
+  mutate(word = reorder_within(word, n, author)) %>%
+  ggplot(aes(n, word, fill = razem)) +
+  geom_col(width = 0.8) +
+  scale_y_reordered() +
+  facet_wrap(vars(author), ncol = 2, scales = "free_y") +
+  xlab("Częstość") +
+  ylab("Słowo") +
+  ggtitle("Dwadzieścia najczęściej używanych słów") +
+  ggthemes::theme_calc() +
+  scale_fill_manual(values = c("#1b9e77", "#e6f5c9") ) +
+  scale_x_continuous(limits = c(0, 1650), expand = c(0, 0)) + 
+  theme(legend.position = "none")
+```
+
+
+\newline
+Na problem można także spojrzeć bardziej całościowo. W tym celu przechodzi się od liczbności 
+do proporcji. Niestety wykorzystując wykres punktowy otrzymuje się wykres, z 
+którego ciężko jest cokolwiek odczytać. Jest to spowodowane nakładaniem na siebie punktów oraz 
+grupowaniem się punktów w kilka kategorii. W celu poprawy wykresu mozna użyć `geom_jitter`. Mimo, że 
+w pewnym stopniu przekłamuje to wykres, to wydaje się mi, że tak długo jak odbiorcy są o tym 
+poinformowani, a modyfikacja nie ingeruje zbytnio w prezentacje danych to jest to podejście 
+dopuszczalne. Z wykres 2 można zauważyć słowo _instant_, które ma większą proporcje w książkach 
+z Sherlockiem. To zgadza się z tym jak zapamiętałem akcję w książkach z Poirot. Jest 
+ona o wiele spokojniejsza, tak samo jak główny bohater.
+
+```{r wykres2,echo=FALSE,fig.cap="Wykres 2",warning=FALSE,message = FALSE,out.width="100%",out.height= "100%"}
+frequency <- together %>% 
+  count(author, word) %>%
+  group_by(author) %>%
+  mutate(Proporcja = n / sum(n)) %>% 
+  select(-n) %>% 
+  pivot_wider(names_from = author, values_from = Proporcja) %>%
+  pivot_longer(`Artur Conan Doyle`,
+               names_to = "author", values_to = "Proporcja")
+
+frequency <- frequency[!is.na(frequency$Proporcja),]
+frequency <- frequency[!is.na(frequency$`Agatha Christie`),]
+# Co chcemy wyróznić
+real_det <-
+  c("genius","thief", "money", "deduction", "poison", "murder", 
+    "confidential", "blackmail", "weapon", "government")
+
+ggplot(frequency, aes(x = Proporcja, y = `Agatha Christie`, 
+                      color = abs(`Agatha Christie` - Proporcja))) +
+  geom_abline(color = "black", lty = 5) +
+  geom_jitter(alpha = 0.1, size = 1.5, width = 0.13, height = 0.13) +
+  ggrepel::geom_text_repel(aes(label = word),
+                           nudge_x = 0.01, nudge_y = 0.01,
+                           direction = "both", max.overlaps = 4,
+                           segment.curvature = -0.1,
+                           segment.ncp = 3,
+                           point.padding = 0.2,
+                           segment.angle = 20) +
+  ggrepel::geom_text_repel(data = frequency %>% filter(word %in% real_det),
+             aes(x = Proporcja, y = `Agatha Christie`, label = word), color = "#d95f02", size = 5) + 
+  scale_x_log10(labels = percent_format()) +
+  scale_y_log10(labels = percent_format()) +
+  scale_color_gradient(limits = c(0, 0.2), 
+                       low = "#74c476", high = "#005a32") +
+  labs(y = "Agatha Christie", x = "Artur Conan Doyle") +
+  ggthemes::theme_tufte() +
+  ggtitle("Proporcje używanych słów", subtitle = bquote("w skali" ~log[10])) +
+  theme(legend.position="none") +
+  annotate("text", x = 0.01, y = 0.01, label = "Równa proporcja")
+```
+
+
+# Analiza sentymentu
+
+Analiza sentymentu pozwala odpowiedzieć na pytanie jakie emocje są związane z danym 
+słowem. W analizie przyjęto założenie, że sentyment dłuższgo tekstu jest sumą 
+sentymetnów poszczególnych jego słów. Ponadto po ustaleniu analizowanego okna akcji 
+wprowadzono korektę na słowa, które negują - wtedy wartość sentymentu danego słowa zyskuje 
+przeciwny znak. Kluczową kwestią w analizie sentymentu jest wykorzystywany słownik. 
+W tej analizie wykorzystano słownik _affin_, który nadaje słwom wartości sentymentu od -5 do 5. Ponadto 
+dokonano analizy sentymentu powieści obu autorów, tj. _Pies Baskerville'ów_ oraz 
+_Morderstwo na polu golfowym_.
+\newline
+
+
+```{r wykres3, echo=FALSE, fig.cap="Wykres 3", warning=FALSE, message = FALSE, out.width="100%", out.height= "100%"}
+negation_words <- c("not", "no", "never", "without")
+# Korekta na negację
+bi_correct <- 
+  rbind(bi_poirot, bi_sherlock) %>%
+  filter(book %in% c("The Hound of the Baskervilles", "The Murder on the Links")) %>%
+  separate(bigram, c("word1", "word2"), sep = " ")  %>%
+  filter(word1 %in% c("not", "no", "never", "without")) %>%
+  mutate(word = word2) %>%
+  select(-word2) %>%
+  inner_join(get_sentiments("afinn"), by = "word") %>%
+  mutate(narrator = linenumber %/% 100)  %>%
+  group_by(book, narrator) %>%
+  summarise(corect_story = sum(value), .groups = "drop") %>%
+  select(book, narrator, corect_story)
+tidy_senti <- together %>%
+  filter(book %in% c("The Hound of the Baskervilles", "The Murder on the Links")) %>%
+  inner_join(get_sentiments("afinn"), by = "word") %>%
+  mutate(narrator = linenumber %/% 100) %>% 
+  group_by(book, author, narrator) %>%
+  summarise(story = sum(value), .groups = "drop") %>%
+  mutate(Emocja = ifelse(story <= 0, "Negatywna", "Pozytywna")) %>%
+  left_join(bi_correct, by = c("book", "narrator")) %>%
+  mutate(corect_story = ifelse(is.na(corect_story), 0, corect_story)) %>%
+  mutate(story = story + corect_story)
+  
+# Wykres stem akcji
+ggplot(tidy_senti, aes(narrator, story, color = Emocja)) +
+  geom_point(aes(fill = Emocja), size = 2, alpha = 0.5, shape = 21, color = "grey") +
+  scale_fill_manual(values = c("#a6611a", "#018571")) +
+  geom_segment( aes(x=narrator, xend=narrator, y=0, yend=story), linetype = 6) +
+  facet_wrap(~book, ncol = 1, scales = "free_x") +
+  scale_color_manual(values = c("#a6611a", "#018571")) +
+  ylab("Sentyment") +
+  xlab("Akcja") +
+  ggtitle("Sentyment w czasie", subtitle = "z korektą na zaprzeczenia") +
+  ggthemes::theme_few() +
+  scale_x_continuous(expand = c(0,2)) +
+  geom_hline(yintercept = 0, alpha = 0.2) +
+  theme(legend.position = "bottom")
+
+
+```
+
+Innym słownikiem jest słownik _bing_. Przydziela on słowom wartości binarne, słowo 
+jest albo pozytywne albo negatywne.
+To z kolei pozwala sprawdzić, jaki sentyment miały najczęściej występujące słowa.
+
+
+```{r wykres4, echo=FALSE, fig.cap="Wykres 4", warning=FALSE, message = FALSE, include = FALSE}
+word_inf <- together %>%
+  filter(book %in% c("The Hound of the Baskervilles", "The Murder on the Links")) %>%
+  inner_join(get_sentiments("bing"), by = "word") %>%
+  count(book, word, sentiment, sort = TRUE) %>%
+  ungroup() %>%
+  mutate(sentiment = ifelse(sentiment == "negative", "Negatywna", "Pozytywna")) %>%
+  mutate(kolor = ifelse(sentiment == "Negatywna", "#d95f02", "#1b9e77"))
+
+sherlock_cloud <- 
+  word_inf %>% 
+  filter(book == "The Hound of the Baskervilles") %>%
+  select(word, n) %>%
+  wordcloud2(backgroundColor = "#f1e2cc", shape = "pentagon", size = 0.8, 
+             color = word_inf %>% filter(book == "The Hound of the Baskervilles") %>% .$kolor)
+
+saveWidget(sherlock_cloud, "tmp.html", selfcontained = F)
+webshot("tmp.html", "webshot.png", delay = 10, vwidth = 1000, vheight = 700)
+```
+
+![wordcloud](webshot.png)
+Wykres 4: Chmura Sherlocka Holmesa
+
+
+```{r wykres5, echo=FALSE, warning=FALSE, message = FALSE, include=FALSE}
+
+poirot_cloud <- 
+  word_inf %>% 
+  filter(book == "The Murder on the Links") %>%
+  select(word, n) %>%
+  wordcloud2(backgroundColor = "#f1e2cc", shape = "pentagon", size = 0.8, 
+             color = word_inf %>% filter(book == "The Murder on the Links") %>% .$kolor)
+saveWidget(poirot_cloud, "tmp2.html", selfcontained = F)
+webshot("tmp2.html", "webshot2.png", delay = 10, vwidth = 900, vheight = 700)
+
+```
+
+![wordcloud](webshot2.png)
+Wykres 5: Chmura Herculesa Poirota
+
+
+# Analiza relacji
+
+Analiza z wykorzystaniem więcej niż jednego słowa miała już miejsce podczas  analizy sentymentu, 
+gdzie wykorzystano zaprzeczenia. Za pomocą dwóch słów można analizować relacje pomiędzy 
+słowami. Jak często dane słowa występują razem oraz jak często dane słowa występują razem 
+w porówaniu do tego jak często występują osobno.
+
+
+```{r graf, echo=FALSE, fig.cap="Wykres 6", warning=FALSE, message = FALSE}
+a <- grid::arrow(type = "closed", length = unit(2, "mm"))
+
+bigram_graph2 <- bi_conan %>%
+  separate(bigram, c("word1", "word2"), sep = " ")  %>%
+  select(-author) %>%
+  filter(n > 9) %>%
+  graph_from_data_frame()
+bigram_graph <- bi_agata %>%
+  separate(bigram, c("word1", "word2"), sep = " ")  %>%
+  select(-author) %>%
+  filter(n > 9) %>%
+  graph_from_data_frame()
+
+bigram_graph3 <- bi_together %>%
+  filter(bigram != "sherlock holmes") %>%
+  separate(bigram, c("word1", "word2"), sep = " ")  %>%
+  filter(n >= 9) %>% 
+  select(word1, word2, n, author) %>%
+  mutate(word1 = ifelse(author == "Artur Conan Doyle", word1, str_c("*", word1))) %>%
+  graph_from_data_frame()
+```
+
+
+```{r wykres6, echo=FALSE, fig.cap="Wykresy 6,7,8", warning=FALSE, message = FALSE, out.width="120%", out.height= "120%"}
+ggraph(bigram_graph, layout = "fr") +
+  geom_edge_arc(aes(edge_alpha = n,
+                    start_cap = label_rect(node1.name),
+                    end_cap = label_rect(node2.name)), 
+                show.legend = TRUE,
+                color = "#af8dc3",
+                arrow = a,
+                start_cap = circle(0.1, 'mm'),
+                end_cap = circle(0.01, 'mm'),
+                strength = 0.5,
+                lineend = "round") +
+  geom_node_point(color = "#7fbf7b", size = 1, alpha = 0.5) +
+  geom_node_text(aes(label = name),size = 2, vjust = 1, hjust = 1,repel = FALSE, check_overlap = TRUE) +
+  scale_edge_alpha_continuous(range = c(0.4,1)) +
+  theme_void() +
+  ggtitle("Współwystępowanie słów w wybranych pozycjach z Herculesem Poirot", 
+          subtitle = "dla częstości powyżej 9")
+
+ggraph(bigram_graph2, layout = "fr") +
+  geom_edge_arc(aes(edge_alpha = n,
+                     start_cap = label_rect(node1.name),
+                     end_cap = label_rect(node2.name)), 
+                show.legend = TRUE,
+                color = "#8da0cb",
+                arrow = a,
+                start_cap = circle(0.1, 'mm'),
+                end_cap = circle(0.01, 'mm'),
+                strength = 0.5,
+                lineend = "round") +
+  geom_node_point(color = "#fc8d62", size = 1, alpha = 0.5) +
+  geom_node_text(aes(label = name), size = 2, vjust = 1, hjust = 1,repel = FALSE, check_overlap = TRUE) +
+  scale_edge_alpha_continuous(range = c(0.4,1)) +
+  theme_void() +
+  ggtitle("Współwystępowanie słów w wybranych pozycjach z Sherlockiem Holmsem", 
+          subtitle = "dla częstości powyżej 9")
+
+
+ggraph(bigram_graph3, layout = "fr") +
+  geom_edge_arc(aes(color = author,
+                    edge_alpha = n,
+                    start_cap = label_rect(node1.name),
+                    end_cap = label_rect(node2.name)),
+                arrow = a, 
+                start_cap = circle(0.1, 'mm'),
+                end_cap = circle(0.01, 'mm'),
+                strength = 0.5,
+                lineend = "round") + 
+  geom_node_text(aes(label = name),size = 2,  vjust = 1, hjust = 1, repel = FALSE, check_overlap = TRUE) +
+  theme_void() +
+  scale_edge_colour_manual(values = c("#d95f02", "#7570b3")) +
+  scale_edge_alpha_continuous(range = c(0.3,1)) +
+  geom_node_point(color = "black", size = 1) +
+  ggtitle("Współwystępowanie słów: Poirot a Holmes", subtitle = "dla częstości powyżej 9")
+
+
+```
+
+
+```{r wykres9, echo=FALSE, fig.cap="Wykres 9,10,11", warning=FALSE, message = FALSE, out.width="120%", out.height= "120%"}
+cor_poirot <- 
+  tidy_poirot %>%
+  mutate(narrator = row_number() %/% 10) %>%
+  group_by(word) %>%
+  filter(n() >= 20) %>%
+  ungroup() %>%
+  pairwise_cor(word, narrator, sort = TRUE)
+
+cor_sherlock <- 
+  tidy_sherlock %>%
+  mutate(narrator = row_number() %/% 10) %>%
+  group_by(word) %>%
+  filter(n() >= 20) %>%
+  ungroup() %>%
+  pairwise_cor(word, narrator, sort = TRUE)
+cor_poirot <- drop_na(cor_poirot)
+cor_sherlock <- drop_na(cor_sherlock)
+
+cor_together <- cor_sherlock %>% mutate(author = "Sir Arthur Conan Doyle")
+cor_together <- rbind(cor_together, cor_poirot  %>% mutate(author = "Agatha Christie"))
+cor_together <- inner_join(cor_together, 
+                           inner_join(cor_poirot[,1:2], cor_sherlock[,1:2], by = c("item1", "item2")))
+cor_together <- cor_together %>% 
+  mutate(item1 = ifelse(author =="Agatha Christie",
+                        str_c("*", item1),
+                        item1
+  ))
+
+cor_sherlock %>%
+  filter(correlation > .2) %>%
+  graph_from_data_frame() %>% 
+  ggraph(layout = "kk") +
+  geom_edge_link(aes(edge_alpha = correlation),
+                 lineend = "round",
+                 color = "#8da0cb") + 
+  geom_node_text(aes(label = name),size = 2, vjust = 1, hjust = 1, repel = FALSE, check_overlap = TRUE) +
+  theme_void() +
+  scale_edge_alpha_continuous(range = c(0.3,1)) +
+  geom_node_point(color = "#fc8d62", size = 1) +
+  # coord_equal()+
+  ggtitle("Korelacja Phi: Sherlock Holmes", subtitle = "dla częstości powyżej 20 i korelacji powyżej 0.2")
+
+cor_poirot %>%
+  filter(correlation > .2) %>%
+  graph_from_data_frame() %>% 
+  ggraph(layout = "kk") +
+  geom_edge_link(aes(edge_alpha = correlation),
+                 lineend = "round",
+                 color = "#af8dc3") + 
+  geom_node_text(aes(label = name),size = 2, vjust = 1, hjust = 1, repel = FALSE, check_overlap = TRUE) +
+  theme_void() +
+  scale_edge_alpha_continuous(range = c(0.3,1)) +
+  geom_node_point(color = "#7fbf7b", size = 1) +
+  # coord_equal()+
+  ggtitle("Korelacja Phi: Hercules Poirot", subtitle = "dla częstości powyżej 20 i korelacji powyżej 0.2")
+
+cor_together %>%
+  filter(correlation > .2) %>%
+  graph_from_data_frame() %>% 
+  ggraph(layout = "kk") +
+  geom_edge_link(aes(color = author,
+                    edge_alpha = correlation),
+                lineend = "round") + 
+  geom_node_text(aes(label = name),size = 2, vjust = 1, hjust = 1, repel = FALSE, check_overlap = TRUE) +
+  theme_void() +
+  scale_edge_colour_manual(values = c("#d95f02", "#7570b3")) +
+  scale_edge_alpha_continuous(range = c(0.3,1)) +
+  geom_node_point(color = "black", size = 1) +
+  # coord_equal()+
+  ggtitle("Korelacja Phi: Hercules Poirot a Sherlock Holmes", subtitle = "dla częstości powyżej 20 i korelacji powyżej 0.2")
+
+```
+
+# Latent Dirichlet Allocation
+
+Latent Dirichlet Allocation jest to algorytm, w którym zakłada się, że istnieją dwie 
+ukryte zmienne. Pierwsza z tych zmiennych okresla prawdopodobieństwo przynależności 
+słowa do danego tematu. Druga zmienna to prawdopodobieństwo przynależności danego 
+dokumentu do temtu. W niniejszej analizie przyjęto, że dokumenty to rozdziały powieści 
+lub pojedyncze opowiadania. Tematy to autorstwo dzieł.
+
+```{r wykres12, echo=FALSE, fig.cap="Wykres 12", warning=FALSE, message = FALSE, out.width="160%"}
+
+lda_sp <- temp %>%
+  filter(chapter != "Chapter 0") %>%
+  unite(document, book, chapter) %>%
+  unnest_tokens(word, text) %>% 
+  mutate(word = str_extract(word, "[a-z']+")) %>%
+  anti_join(stop_words) %>%
+  filter(!(word %in% c("sherlock", "holmes", "poirot", "watson", "hercules"))) %>% 
+  count(document, word, sort = TRUE) %>%
+  cast_dtm(document, word, n)
+
+
+lda_result <- LDA(lda_sp, k = 2, control = list(seed = 123))
+gamma_chapter <- tidy(lda_result, matrix = "gamma")
+gamma_chapter %>%
+  separate(document, c("title", "chapter"), sep = "_", convert = TRUE) %>% 
+  mutate(title = reorder(title, gamma * topic)) %>%
+  mutate(topic = ifelse(topic == 1,
+                        "Doyle",
+                        "Christie")) %>% 
+  ggplot(aes(factor(topic), gamma)) +
+  geom_boxplot(outlier.colour="#d95f02",
+               outlier.fill="#d95f02",
+               outlier.size = 2,
+               outlier.shape = 8) +
+  facet_wrap(~ title) +
+  labs(x = "Autor", y = "Prawdopodobieństwo") +
+  ggthemes::theme_hc() +
+  ggtitle("Ocena dopasowania dokumentów do autora")
+```
+
+
+
+# Kod
+
+## Pobranie danych
+
+`gutenberg_download(c(834, 108, 3070))`
+`gutenberg_download(c(61262, 67160, 67173, 58866, 863, 66446))`
+
+## Stosowane paczki oraz ziarno
+```{r paczki, eval=FALSE}
+```
+    
+## Wstępne przygotowanie danych
+```{r wrangling, eval = FALSE}
+```
+
+## Wykres1
+```{r wykres1, eval = FALSE}
+```
+
+## Wykres2
+```{r wykres2, eval = FALSE}
+```
+
+## Wykres3
+```{r wykres3, eval = FALSE}
+```
+
+## Wykres4
+```{r wykres4, eval = FALSE}
+```
+
+## Wykres5
+```{r wykres5, eval = FALSE}
+```
+
+## Przygotowanie danych do wordcloud
+```{r graf, eval = FALSE}
+```
+
+## Wykres 6, 7 oraz 8
+```{r wykres6, eval = FALSE}
+```
+
+## Wykres9,10 oraz 11
+```{r wykres9, eval = FALSE}
+```
+
+## Wykres 12
+```{r wykres12, eval = FALSE}
+```
